@@ -124,6 +124,8 @@ ParsedUri_t parse_uri(const char *uri)
     ParsedUri_t res;
     memset(&res, 0, sizeof(ParsedUri_t));
 
+    const char *ori = uri;
+
     if (uri[0] == '/')
         uri++;
     const char *pkg_start = uri;
@@ -188,7 +190,14 @@ ParsedUri_t parse_uri(const char *uri)
     // 确定请求类型
     if (strlen(res.path) == 0)
     {
-        res.type = ENTRY;
+        if (ori[strlen(ori) - 1] == '/')
+        {
+            res.type = REQ_DIR;
+        }
+        else
+        {
+            res.type = ENTRY;
+        }
     }
     else if (res.path[strlen(res.path) - 1] == '/')
     {
