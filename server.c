@@ -123,41 +123,66 @@ ParsedUri_t parse_uri(const char *uri)
 
     if (uri[0] == '/')
         uri++;
+    const char *pkg_start = uri;
+    const char *pkg_end = NULL;
+    const char *ver_start = NULL;
+    const char *path_start = NULL;
 
-    char *at_sign = strchr(uri, '@');
-    char *slash_sign = strchr(uri, '/');
-
-    if (at_sign && (!slash_sign || at_sign < slash_sign))
+    if (*pkg_start == '@')
     {
-        /*package @ version*/
-        size_t pkg_len = at_sign - uri;
-        strncpy(res.package, uri, pkg_len);
-        // 版本号结束位置在...
-        const char *ver_start = at_sign + 1;
-        const char *ver_end = slash_sign ? slash_sign : uri + strlen(uri);
-        strncpy(res.version, ver_start, ver_end - ver_start);
+        const char *scope_slash = strchr(pkg_start + 1, '/'); // 跳过包头的@，寻找第一个斜杠开始包名
+        if (scope_slash)
+        {
+            pkg_end = strchr(scope_slash + 1, '@'); // 在包名后寻找@，开始版本号
+        }
     }
     else
     {
-        // 若只有package，则默认为'latest'
-        if (slash_sign)
+        // 非scope包，包名在第一个@前结束
+        pkg_end = strchr(pkg_start, '@');
+    }
+
+    if (!pkg_end)
+    {
+        // 没有找到@，包名在第一个/前或末尾结束
+        pkg_end = strchr(pkg_start, '/');
+        if (!pkg_end)
         {
-            strncpy(res.package, uri, slash_sign - uri);
+            pkg_end = pkg_start + strlen(pkg_start);
+        }
+    }
+    strncpy(res.package, pkg_start, pkg_end - pkg_start);
+
+    // 查找版本和路径
+    ver_start = strchr(pkg_end, '@');
+    if (ver_start)
+    {
+        // 找到了版本分隔符'@'
+        path_start = strchr(ver_start + 1, '/');
+        if (path_start)
+        {
+            // 有路径
+            strncpy(res.version, ver_start + 1, path_start - (ver_start + 1));
+            strcpy(res.path, path_start + 1);
         }
         else
         {
-            strncpy(res.package, uri, strlen(uri));
+            // 只有版本，没有路径
+            strcpy(res.version, ver_start + 1);
         }
-        strcpy(res.version, "latest");
     }
-
-    // 如果接下来还有路径 (slash_sign != null)
-    if (slash_sign)
+    else
     {
-        strcpy(res.path, slash_sign + 1);
+        // 没有找到版本分隔符'@'，版本默认为 "latest"
+        strcpy(res.version, "latest");
+        path_start = strchr(pkg_end, '/');
+        if (path_start)
+        {
+            strcpy(res.path, path_start + 1);
+        }
     }
 
-    // 请求类型是
+    // 确定请求类型
     if (strlen(res.path) == 0)
     {
         res.type = ENTRY;
@@ -186,6 +211,10 @@ int download_tar(const char *tar_url, const char *outfile)
         return -1;
 
     curl_easy_setopt(curl, CURLOPT_URL, tar_url);
+    // 经测试使用 禁用ssl验证
+    // curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    // curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    // 测试使用代码结束（未解决问题）
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
     CURLcode res = curl_easy_perform(curl);
