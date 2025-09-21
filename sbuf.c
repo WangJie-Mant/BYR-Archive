@@ -27,7 +27,7 @@ void sbuf_insert(sbuf_t *sp, int item)
     V(&sp->items); // 增加可用项目数
 }
 
-void sbuf_remove(sbuf_t *sp)
+int sbuf_remove(sbuf_t *sp)
 {
     /*从sp->buffer移除并返回一个item*/
     int item;
