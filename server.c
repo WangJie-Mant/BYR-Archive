@@ -7,6 +7,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+typedef enum
+{
+    false = 0,
+    true = 1
+} bool;
+
 struct Membuffer
 {
     char *data;
@@ -44,10 +50,10 @@ void client_error(int fd, char *cause, char *errnum, char *shortmsg, char *longm
 const char *get_content_type(const char *filename);                                  // 根据文件后缀返回对应的mime
 void serve_file(int fd, const char *filepath);                                       // 发送文件内容到客户端
 void serve_dir(int fd, const char *dirpath, const char *uri);                        // 发送目录列表到客户端
+int compare_versions(const char *v1, const char *v2);                                // 比较两个版本号的大小，v1>v2返回1，v1==v2返回0，v1<v2返回-1
 
 // 多线程处理函数
-void *
-worker(void *arg);
+void *worker(void *arg);
 
 /*main begin*/
 int main(int argc, char **argv)
@@ -563,25 +569,75 @@ void server_doit(int connfd)
         }
 
         cJSON *target_version_json = NULL;
-        char actual_version[64];
+        char actual_version[64] = {0};
         strcpy(actual_version, parsed_uri.version);
 
         if (strcmp(parsed_uri.version, "latest") == 0)
         {
+            // 从metadata中找到dist-tags
             cJSON *dist_tags = cJSON_GetObjectItem(json, "dist-tags");
             if (dist_tags)
             {
+                // 从dist-tags中找到latest字段，并取其值
                 cJSON *latest_version_item = cJSON_GetObjectItem(dist_tags, "latest");
                 if (latest_version_item && cJSON_IsString(latest_version_item))
                 {
+                    // 将获取到的版本号存入actual_version中，此时对应的版本就是latest
                     strcpy(actual_version, latest_version_item->valuestring);
+                    // 查找对应的版本
                     target_version_json = cJSON_GetObjectItem(versions, actual_version);
                 }
             }
         }
+        else if (parsed_uri.version[0] == '^' || parsed_uri.version[0] == '~')
+        {
+            char range_type = parsed_uri.version[0]; // 取出范围符号
+            const char *base_version = parsed_uri.version + 1;
+            int base_major = 0, base_minor = 0, base_patch = 0; // 基础版本号
+            sscanf(base_version, "%d.%d.%d", &base_major, &base_minor, &base_patch);
+
+            char matched_version[64] = {0};
+            cJSON *current_version_obj = NULL;
+            cJSON_ArrayForEach(current_version_obj, versions)
+            {
+                const char *current_version_str = current_version_obj->string;
+                int cur_major = 0, cur_minor = 0, cur_patch = 0;
+                sscanf(current_version_str, "%d.%d.%d", &cur_major, &cur_minor, &cur_patch);
+
+                // 检查遍历到的条目是否满足条件
+                bool is_matched = false;
+                if (compare_versions(current_version_str, base_version) >= 0)
+                {
+                    if (range_type == '^' && cur_major == base_major)
+                    {
+                        is_matched = true;
+                    }
+                    else if (range_type == '~' && cur_major == base_major && cur_minor == base_minor)
+                    {
+                        is_matched = true;
+                    }
+                }
+                if (is_matched)
+                {
+                    if (strlen(matched_version) == 0 || compare_versions(current_version_str, matched_version) > 0)
+                    {
+                        strcpy(matched_version, current_version_str);
+                    }
+                }
+            }
+            if (strlen(matched_version) > 0)
+            {
+                strcpy(actual_version, matched_version);
+            }
+        }
         else
         {
-            target_version_json = cJSON_GetObjectItem(versions, parsed_uri.version);
+            strcpy(actual_version, parsed_uri.version);
+        }
+        if (strlen(actual_version) > 0)
+        {
+            // 最后用actual_version去versions中查找对应的版本
+            target_version_json = cJSON_GetObjectItem(versions, actual_version);
         }
 
         if (!target_version_json)
@@ -752,4 +808,21 @@ void client_error(int fd, char *cause, char *errnum, char *shortmsg, char *longm
     Rio_writen(fd, buf, strlen(buf));
     sprintf(buf, "<hr><em>The Tiny Web server</em>\r\n");
     Rio_writen(fd, buf, strlen(buf));
+}
+
+int compare_versions(const char *v1, const char *v2)
+{
+    int major1 = 0, minor1 = 0, patch1 = 0;
+    int major2 = 0, minor2 = 0, patch2 = 0;
+
+    sscanf(v1, "%d.%d.%d", &major1, &minor1, &patch1);
+    sscanf(v2, "%d.%d.%d", &major2, &minor2, &patch2);
+
+    if (major1 != major2)
+        return (major1 > major2) ? 1 : -1;
+    if (minor1 != minor2)
+        return (minor1 > minor2) ? 1 : -1;
+    if (patch1 != patch2)
+        return (patch1 > patch2) ? 1 : -1;
+    return 0;
 }
