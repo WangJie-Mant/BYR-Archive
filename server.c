@@ -41,6 +41,9 @@ static size_t write_cb(void *contents, size_t size, size_t nmemb, void *userp); 
 void server_doit(int connfd);                                                        // 供worker调用的处理函数，负责处理单个请求
 void read_requesthdrs(rio_t *rp);                                                    // 读取请求头并发送到服务器终端的函数
 void client_error(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg); // 发送错误信息到客户端
+const char *get_content_type(const char *filename);                                  // 根据文件后缀返回对应的mime
+void serve_file(int fd, const char *filepath);                                       // 发送文件内容到客户端
+void serve_dir(int fd, const char *dirpath, const char *uri);                        // 发送目录列表到客户端
 
 // 多线程处理函数
 void *
@@ -357,133 +360,137 @@ static size_t write_cb(void *contents, size_t size, size_t nmemb, void *userp)
     return realsize;
 }
 
+const char *get_content_type(const char *filename)
+{
+    /*根据filename返回对应的mime*/
+    if (strstr(filename, ".html"))
+        return "text/html; charset=utf-8";
+    if (strstr(filename, ".css"))
+        return "text/css; charset=utf-8";
+    if (strstr(filename, ".js"))
+        return "application/javascript; charset=utf-8";
+    if (strstr(filename, ".json"))
+        return "application/json; charset=utf-8";
+    if (strstr(filename, ".png"))
+        return "image/png";
+    if (strstr(filename, ".jpg") || strstr(filename, ".jpeg"))
+        return "image/jpeg";
+    if (strstr(filename, ".gif"))
+        return "image/gif";
+    if (strstr(filename, ".svg"))
+        return "image/svg+xml";
+    return "text/plain; charset=utf-8"; // 默认
+}
+
+void serve_file(int fd, const char *filepath)
+{
+    /*返回文件内容，构造http响应*/
+    char filetype[MAXLINE], buf[MAXBUF];
+    int filefd;
+    struct stat sbuf;
+
+    if (stat(filepath, &sbuf) < 0)
+    {
+        client_error(fd, filepath, "404", "Not Found", "Server couldn't find this file");
+        return;
+    }
+
+    if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode))
+    {
+        client_error(fd, filepath, "403", "Forbidden", "Server couldn't read this file");
+        return;
+    }
+
+    strcpy(filetype, get_content_type(filepath));
+    sprintf(buf, "HTTP/1.0 200 OK\r\n");
+    sprintf(buf, "%sServer: Tiny Web Server\r\n", buf);
+    sprintf(buf, "%sConnection: close\r\n", buf);
+    sprintf(buf, "%sContent-length: %ld\r\n", buf, sbuf.st_size);
+    sprintf(buf, "%sContent-type: %s\r\n\r\n", buf, filetype);
+    Rio_writen(fd, buf, strlen(buf));
+    printf("Response headers:\n%s", buf);
+
+    filefd = Open(filepath, O_RDONLY, 0);
+    char *srcp = Mmap(0, sbuf.st_size, PROT_READ, MAP_PRIVATE, filefd, 0);
+    Close(filefd);
+    Rio_writen(fd, srcp, sbuf.st_size);
+    Munmap(srcp, sbuf.st_size);
+}
+
+void serve_dir(int fd, const char *dirpath, const char *uri)
+{
+    char buf[MAXBUF], entry_buf[MAXLINE];
+    DIR *dir;
+    struct dirent *entry;
+
+    dir = opendir(dirpath);
+    if (dir == NULL)
+    {
+        client_error(fd, dirpath, "404", "Not Found", "Could not open directory");
+        return;
+    }
+
+    sprintf(buf, "HTTP/1.0 200 OK\r\n");
+    sprintf(buf, "%sContent-type: text/html; charset=utf-8\r\n\r\n", buf);
+    Rio_writen(fd, buf, strlen(buf));
+
+    sprintf(buf, "<html><head><title>Index of %s</title></head><body>", uri);
+    sprintf(buf, "%s<h1>Index of %s</h1><hr><ul>", buf, uri);
+    Rio_writen(fd, buf, strlen(buf));
+
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        // 判断是目录还是文件，在目录链接后加斜杠
+        char full_path[1024];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dirpath, entry->d_name);
+        struct stat sbuf;
+        stat(full_path, &sbuf);
+        if (S_ISDIR(sbuf.st_mode))
+        {
+            sprintf(entry_buf, "<li><a href=\"%s/\">%s/</a></li>", entry->d_name, entry->d_name);
+        }
+        else
+        {
+            sprintf(entry_buf, "<li><a href=\"%s\">%s</a></li>", entry->d_name, entry->d_name);
+        }
+        Rio_writen(fd, entry_buf, strlen(entry_buf));
+    }
+    closedir(dir);
+
+    sprintf(buf, "</ul><hr></body></html>");
+    Rio_writen(fd, buf, strlen(buf));
+}
 void server_doit(int connfd)
 {
     rio_t rio;
     char buffer[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
 
     Rio_readinitb(&rio, connfd);
-    if (!Rio_readlineb(&rio, buffer, MAXLINE)) // 读取请求行
+    if (!Rio_readlineb(&rio, buffer, MAXLINE))
         return;
 
     sscanf(buffer, "%s %s %s", method, uri, version);
     if (strcasecmp(method, "GET"))
     {
-        fprintf(stdout, "Received request:\n");
-        fprintf(stdout, "%s", buffer);
         client_error(connfd, method, "501", "Not Implemented", "Server does not implement this method");
         return;
     }
 
     read_requesthdrs(&rio);
 
-    // 第一步，解析uri
+    // 1. 解析URI
     ParsedUri_t parsed_uri = parse_uri(uri);
-
-    // 第二步，将registry, package, version拼接成请求url
-    char reg_url[MAXLINE];
-    snprintf(reg_url, sizeof(reg_url), "%s/%s", registry, parsed_uri.package);
-
-    // 第三步，像registry请求
-    struct Membuffer resp = {0};
-
-    CURL *curl = curl_easy_init();
-    if (!curl)
+    if (strlen(parsed_uri.package) == 0)
     {
-        client_error(connfd, "CURL init failed", "500", "Internal Server Error", "Server failed to initialize CURL");
-        return;
-    }
-    curl_easy_setopt(curl, CURLOPT_URL, reg_url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    CURLcode cres = curl_easy_perform(curl);
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    curl_easy_cleanup(curl);
-
-    if (cres != CURLE_OK || http_code != 200 || !resp.data)
-    {
-        client_error(connfd, reg_url, "502", "Bad Gateway", "Failed to fetch metadata");
-        free(resp.data);
+        client_error(connfd, uri, "400", "Bad Request", "Could not parse package name");
         return;
     }
 
-    // 从 resp.data 中解析 tarball_url
-    char tarball_url[MAXLINE] = {0};
-    cJSON *json = cJSON_Parse(resp.data);
-    if (!json)
-    {
-        client_error(connfd, reg_url, "500", "Internal Server Error", "Failed to parse JSON");
-        free(resp.data);
-        return;
-    }
-    cJSON *versions = cJSON_GetObjectItem(json, "versions");
-    if (!versions)
-    {
-        client_error(connfd, reg_url, "500", "Internal Server Error", "No versions found in metadata");
-        cJSON_Delete(json);
-        free(resp.data);
-        return;
-    }
-    cJSON *target_version = NULL;
-    // version==latest
-    if (strcmp(parsed_uri.version, "latest") == 0)
-    {
-        cJSON *dist_tags = cJSON_GetObjectItem(json, "dist-tags");
-        if (dist_tags)
-        {
-            cJSON *latest_version = cJSON_GetObjectItem(dist_tags, "latest");
-            if (latest_version && cJSON_IsString(latest_version))
-            {
-                // 使用最新版本号查找
-                target_version = cJSON_GetObjectItem(versions, latest_version->valuestring);
-            }
-        }
-    }
-    else
-    {
-        target_version = cJSON_GetObjectItem(versions, parsed_uri.version);
-    }
-
-    if (!target_version)
-    {
-        client_error(connfd, parsed_uri.version, "404", "Not Found", "Specified version not found");
-        cJSON_Delete(json);
-        free(resp.data);
-        return;
-    }
-    cJSON *dist = cJSON_GetObjectItem(target_version, "dist");
-    if (!dist)
-    {
-        client_error(connfd, reg_url, "500", "Internal Server Error", "No dist found in metadata");
-        cJSON_Delete(json);
-        free(resp.data);
-        return;
-    }
-    cJSON *tarball_item = cJSON_GetObjectItem(dist, "tarball");
-    if (!tarball_item || !cJSON_IsString(tarball_item))
-    {
-        client_error(connfd, reg_url, "500", "Internal Server Error", "Tarball URL not found in JSON");
-        cJSON_Delete(json);
-        free(resp.data);
-        return;
-    }
-
-    strcpy(tarball_url, tarball_item->valuestring);
-    cJSON_Delete(json);
-    free(resp.data);
-
-    // 构造本地 outfile并调用 download_tar
-    if (mkdir(TMP_DIR, 0755) < 0 && errno != EEXIST)
-    {
-        client_error(connfd, TMP_DIR, "500", "Internal Server Error", "mkdir failed");
-        return;
-    }
-
-    // 处理scoped包名中的'/'，替换为'_'
-    char safe_package_name[sizeof(parsed_uri.package) + 1];
+    // 2. 构造本地路径
+    char safe_package_name[sizeof(parsed_uri.package)];
     strncpy(safe_package_name, parsed_uri.package, sizeof(safe_package_name));
     for (char *p = safe_package_name; *p; p++)
     {
@@ -491,17 +498,202 @@ void server_doit(int connfd)
             *p = '_';
     }
 
-    char outfile[MAXLINE];
-    snprintf(outfile, sizeof(outfile), "%s/%s-%s.tar.gz", TMP_DIR, safe_package_name, parsed_uri.version);
+    char outdir[MAXLINE];
+    snprintf(outdir, sizeof(outdir), "%s/%s-%s", TMP_DIR, safe_package_name, parsed_uri.version);
 
-    if (download_tar(tarball_url, outfile) != 0)
+    char target_filepath[MAXLINE];
+    snprintf(target_filepath, sizeof(target_filepath), "%s/%s", outdir, parsed_uri.path);
+
+    // 3. 检查缓存是否存在，如果不存在则下载
+    struct stat sbuf;
+    if (stat(outdir, &sbuf) != 0 || !S_ISDIR(sbuf.st_mode))
     {
-        client_error(connfd, tarball_url, "502", "Bad Gateway", "download/extract failed");
-        return;
+        printf("Cache miss for %s. Downloading...\n", outdir);
+
+        // 构造registry url
+        char reg_url[MAXLINE];
+        snprintf(reg_url, sizeof(reg_url), "%s/%s", registry, parsed_uri.package);
+
+        struct Membuffer resp = {0};
+        CURL *curl = curl_easy_init();
+        if (!curl)
+        {
+            return;
+        }
+        curl_easy_setopt(curl, CURLOPT_URL, reg_url);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+        CURLcode cres = curl_easy_perform(curl);
+        long http_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_easy_cleanup(curl);
+
+        if (cres != CURLE_OK || http_code != 200 || !resp.data)
+        {
+            client_error(connfd, reg_url, "502", "Bad Gateway", "Failed to fetch metadata");
+            free(resp.data);
+            return;
+        }
+
+        char tarball_url[MAXLINE] = {0};
+        cJSON *json = cJSON_Parse(resp.data);
+        if (!json)
+        {
+            free(resp.data);
+            return;
+        }
+
+        cJSON *versions = cJSON_GetObjectItem(json, "versions");
+        if (!versions)
+        {
+            cJSON_Delete(json);
+            free(resp.data);
+            return;
+        }
+
+        cJSON *target_version_json = NULL;
+        char actual_version[64];
+        strcpy(actual_version, parsed_uri.version);
+
+        if (strcmp(parsed_uri.version, "latest") == 0)
+        {
+            cJSON *dist_tags = cJSON_GetObjectItem(json, "dist-tags");
+            if (dist_tags)
+            {
+                cJSON *latest_version_item = cJSON_GetObjectItem(dist_tags, "latest");
+                if (latest_version_item && cJSON_IsString(latest_version_item))
+                {
+                    strcpy(actual_version, latest_version_item->valuestring);
+                    target_version_json = cJSON_GetObjectItem(versions, actual_version);
+                }
+            }
+        }
+        else
+        {
+            target_version_json = cJSON_GetObjectItem(versions, parsed_uri.version);
+        }
+
+        if (!target_version_json)
+        {
+            cJSON_Delete(json);
+            free(resp.data);
+            return;
+        }
+
+        // 更新 outdir 和 target_filepath 以使用确切的版本号
+        snprintf(outdir, sizeof(outdir), "%s/%s-%s", TMP_DIR, safe_package_name, actual_version);
+        snprintf(target_filepath, sizeof(target_filepath), "%s/%s", outdir, parsed_uri.path);
+
+        cJSON *dist = cJSON_GetObjectItem(target_version_json, "dist");
+        cJSON *tarball_item = dist ? cJSON_GetObjectItem(dist, "tarball") : NULL;
+        if (!tarball_item || !cJSON_IsString(tarball_item))
+        { /* ... 错误处理 ... */
+            cJSON_Delete(json);
+            free(resp.data);
+            return;
+        }
+
+        strncpy(tarball_url, tarball_item->valuestring, sizeof(tarball_url) - 1);
+
+        char outfile[MAXLINE];
+        snprintf(outfile, sizeof(outfile), "%s.tar.gz", outdir);
+
+        if (download_tar(tarball_url, outfile) != 0)
+        {
+            client_error(connfd, tarball_url, "502", "Bad Gateway", "download/extract failed");
+            cJSON_Delete(json);
+            free(resp.data);
+            return;
+        }
+        cJSON_Delete(json);
+        free(resp.data);
+    }
+    else
+    {
+        printf("Cache hit for %s.\n", outdir);
     }
 
-    Rio_writen(connfd, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nok\n", 45);
-    return;
+    // 4. 根据请求类型提供服务
+    if (parsed_uri.type == ENTRY)
+    {
+        // --- 入口点解析逻辑 ---
+        char package_json_path[MAXLINE];
+        snprintf(package_json_path, sizeof(package_json_path), "%s/package/package.json", outdir);
+
+        // npm 包解压后通常会有一个 'package' 子目录
+        if (stat(package_json_path, &sbuf) != 0)
+        {
+            snprintf(package_json_path, sizeof(package_json_path), "%s/package.json", outdir);
+        }
+
+        char entry_point_path[MAXLINE] = "index.js"; // 默认返回index.js
+        FILE *f = fopen(package_json_path, "r");
+        if (f)
+        {
+            fseek(f, 0, SEEK_END);
+            long len = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            char *pkg_content = malloc(len + 1);
+            fread(pkg_content, 1, len, f);
+            fclose(f);
+            pkg_content[len] = '\0';
+
+            cJSON *pkg_json = cJSON_Parse(pkg_content);
+            if (pkg_json)
+            {
+                cJSON *exports = cJSON_GetObjectItem(pkg_json, "exports");
+                cJSON *main = cJSON_GetObjectItem(pkg_json, "main");
+                if (exports)
+                {
+                    cJSON *dot_export = cJSON_GetObjectItem(exports, ".");
+                    if (dot_export)
+                    {
+                        if (cJSON_IsString(dot_export))
+                        {
+                            strcpy(entry_point_path, dot_export->valuestring);
+                        }
+                        else if (cJSON_IsObject(dot_export))
+                        {
+                            cJSON *default_export = cJSON_GetObjectItem(dot_export, "default");
+                            if (default_export && cJSON_IsString(default_export))
+                            {
+                                strcpy(entry_point_path, default_export->valuestring);
+                            }
+                        }
+                    }
+                }
+                else if (main && cJSON_IsString(main))
+                {
+                    strcpy(entry_point_path, main->valuestring);
+                }
+                cJSON_Delete(pkg_json);
+            }
+            free(pkg_content);
+        }
+
+        // 修正入口点路径，去掉开头的 './'
+        if (strncmp(entry_point_path, "./", 2) == 0)
+        {
+            memmove(entry_point_path, entry_point_path + 2, strlen(entry_point_path) - 1);
+        }
+
+        snprintf(target_filepath, sizeof(target_filepath), "%s/package/%s", outdir, entry_point_path);
+        if (stat(target_filepath, &sbuf) != 0)
+        {
+            snprintf(target_filepath, sizeof(target_filepath), "%s/%s", outdir, entry_point_path);
+        }
+        serve_file(connfd, target_filepath);
+    }
+    else if (parsed_uri.type == REQ_DIR)
+    {
+        serve_dir(connfd, target_filepath, uri);
+    }
+    else // REQ_FILE
+    {
+        serve_file(connfd, target_filepath);
+    }
 }
 
 void read_requesthdrs(rio_t *rp)
