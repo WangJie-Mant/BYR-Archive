@@ -51,6 +51,7 @@ const char *get_content_type(const char *filename);                             
 void serve_file(int fd, const char *filepath);                                       // 发送文件内容到客户端
 void serve_dir(int fd, const char *dirpath, const char *uri);                        // 发送目录列表到客户端
 int compare_versions(const char *v1, const char *v2);                                // 比较两个版本号的大小，v1>v2返回1，v1==v2返回0，v1<v2返回-1
+void url_decode(const char *src, char *dst);                                         // URL解码函数
 
 // 多线程处理函数
 void *worker(void *arg);
@@ -434,10 +435,11 @@ void serve_file(int fd, const char *filepath)
 
 void serve_dir(int fd, const char *dirpath, const char *uri)
 {
-    char buf[MAXBUF], entry_buf[MAXLINE];
+    char buf[MAXBUF], entry_buf[MAXLINE], decoded_uri[MAXLINE];
     DIR *dir;
     struct dirent *entry;
 
+    url_decode(uri, decoded_uri);
     dir = opendir(dirpath);
     if (dir == NULL)
     {
@@ -449,8 +451,8 @@ void serve_dir(int fd, const char *dirpath, const char *uri)
     sprintf(buf, "%sContent-type: text/html; charset=utf-8\r\n\r\n", buf);
     Rio_writen(fd, buf, strlen(buf));
 
-    sprintf(buf, "<html><head><title>Index of %s</title></head><body>", uri);
-    sprintf(buf, "%s<h1>Index of %s</h1><hr><ul>", buf, uri);
+    sprintf(buf, "<html><head><title>Index of %s</title></head><body>", decoded_uri);
+    sprintf(buf, "%s<h1>Index of %s</h1><hr><ul>", buf, decoded_uri);
     Rio_writen(fd, buf, strlen(buf));
 
     while ((entry = readdir(dir)) != NULL)
@@ -482,6 +484,7 @@ void server_doit(int connfd)
 {
     rio_t rio;
     char buffer[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
+    char decoded_uri[MAXLINE];
 
     Rio_readinitb(&rio, connfd);
     if (!Rio_readlineb(&rio, buffer, MAXLINE))
@@ -494,13 +497,18 @@ void server_doit(int connfd)
         return;
     }
 
+    // 在解析前对uri调用解码函数
+    url_decode(uri, decoded_uri);
+    // DEBUG: printf
+    printf("decoded uri: %s\n", decoded_uri);
+
     read_requesthdrs(&rio);
 
     // 1. 解析URI
-    ParsedUri_t parsed_uri = parse_uri(uri);
+    ParsedUri_t parsed_uri = parse_uri(decoded_uri);
     if (strlen(parsed_uri.package) == 0)
     {
-        client_error(connfd, uri, "400", "Bad Request", "Could not parse package name");
+        client_error(connfd, decoded_uri, "400", "Bad Request", "Could not parse package name");
         return;
     }
 
@@ -775,11 +783,8 @@ void read_requesthdrs(rio_t *rp)
 {
     char buf[MAXLINE];
 
-    Rio_readlineb(rp, buf, MAXLINE);
-    printf("%s", buf);
-    while (strcmp(buf, "\r\n")) // 直到读到空行结束
+    while (Rio_readlineb(rp, buf, MAXLINE) > 0 && strcmp(buf, "\r\n")) // 直到读到空行结束
     {
-        Rio_readlineb(rp, buf, MAXLINE);
         printf("%s", buf);
     }
     return;
@@ -825,4 +830,41 @@ int compare_versions(const char *v1, const char *v2)
     if (patch1 != patch2)
         return (patch1 > patch2) ? 1 : -1;
     return 0;
+}
+
+void url_decode(const char *src, char *dst)
+{
+    char a, b;
+    while (*src)
+    {
+        if ((*src == '%') &&
+            ((a = src[1]) && (b = src[2])) &&
+            (isxdigit(a) && isxdigit(b)))
+        {
+            if (a >= 'a')
+                a -= 'a' - 'A';
+            if (a >= 'A')
+                a -= ('A' - 10);
+            else
+                a -= '0';
+            if (b >= 'a')
+                b -= 'a' - 'A';
+            if (b >= 'A')
+                b -= ('A' - 10);
+            else
+                b -= '0';
+            *dst++ = 16 * a + b;
+            src += 3;
+        }
+        else if (*src == '+')
+        {
+            *dst++ = ' ';
+            src++;
+        }
+        else
+        {
+            *dst++ = *src++;
+        }
+    }
+    *dst++ = '\0';
 }
