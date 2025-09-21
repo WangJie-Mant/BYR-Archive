@@ -640,7 +640,21 @@ void server_doit(int connfd)
         }
         else
         {
-            strcpy(actual_version, parsed_uri.version);
+            cJSON *dist_tags = cJSON_GetObjectItem(json, "dist-tags");
+            cJSON *tag_item = NULL;
+            if (dist_tags)
+            {
+                tag_item = cJSON_GetObjectItem(dist_tags, parsed_uri.version);
+            }
+
+            if (tag_item && cJSON_IsString(tag_item))
+            {
+                strcpy(actual_version, tag_item->valuestring);
+            }
+            else
+            {
+                strcpy(actual_version, parsed_uri.version);
+            }
         }
         if (strlen(actual_version) > 0)
         {
