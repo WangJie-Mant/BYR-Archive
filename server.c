@@ -481,8 +481,18 @@ void server_doit(int connfd)
         client_error(connfd, TMP_DIR, "500", "Internal Server Error", "mkdir failed");
         return;
     }
+
+    // 处理scoped包名中的'/'，替换为'_'
+    char safe_package_name[sizeof(parsed_uri.package) + 1];
+    strncpy(safe_package_name, parsed_uri.package, sizeof(safe_package_name));
+    for (char *p = safe_package_name; *p; p++)
+    {
+        if (*p == '/')
+            *p = '_';
+    }
+
     char outfile[MAXLINE];
-    snprintf(outfile, sizeof(outfile), "%s/%s-%s.tar.gz", TMP_DIR, parsed_uri.package, parsed_uri.version);
+    snprintf(outfile, sizeof(outfile), "%s/%s-%s.tar.gz", TMP_DIR, safe_package_name, parsed_uri.version);
 
     if (download_tar(tarball_url, outfile) != 0)
     {
