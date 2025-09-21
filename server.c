@@ -1,0 +1,471 @@
+#include "csapp.h"
+#include "sbuf.h"
+#include <curl/curl.h>
+#include <archive.h>
+#include <archive_entry.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+struct Membuffer
+{
+    char *data;
+    size_t size;
+};
+
+typedef enum
+{
+    ENTRY,
+    REQ_DIR,
+    REQ_FILE
+} RequestedType_t;
+
+typedef struct
+{
+    char package[128];
+    char version[64];
+    char path[512];
+    RequestedType_t type;
+} ParsedUri_t;
+
+sbuf_t sbuf;
+char *registry;
+#define SBUF_SIZE 16
+#define WORKER_THREADS 4
+#define TMP_DIR "./tmp"
+
+const char *get_registry_url();                                                      // 程序启动时调用。获取环境变量"REGISTRY"的值。若无则返回默认url
+ParsedUri_t parse_uri(const char *uri);                                              // 解析uri，提取出registry, package, version
+int download_tar(const char *tar_url, const char *outfile);                          // 下载url指向的tar包，保存为outfile
+static size_t write_cb(void *contents, size_t size, size_t nmemb, void *userp);      // 解包tarball使用的回调函数，在download_tar中被调用
+void server_doit(int connfd);                                                        // 供worker调用的处理函数，负责处理单个请求
+void read_requesthdrs(rio_t *rp);                                                    // 读取请求头并发送到服务器终端的函数
+void client_error(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg); // 发送错误信息到客户端
+
+// 多线程处理函数
+void *
+worker(void *arg);
+
+/*main begin*/
+int main(int argc, char **argv)
+{
+    char *uri, package[MAXLINE], version[MAXLINE];
+    char url[MAXLINE], outfile[MAXLINE];
+    char client_hostname[MAXLINE], client_port[MAXLINE];
+    int listenfd, connfd;
+    socklen_t clientlen;
+    struct sockaddr_storage clientaddr;
+    pthread_t tid;
+    ParsedUri_t parsed_uri;
+    rio_t rio;
+
+    if (argc != 2)
+    {
+        fprintf(stderr, "usage: %s <port>\n", argv[0]);
+        exit(1);
+    }
+
+    registry = get_registry_url();
+
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0)
+    {
+        fprintf(stderr, "curl global init failed\n");
+        exit(1);
+    }
+    listenfd = Open_listenfd(argv[1]);
+    sbuf_init(&sbuf, SBUF_SIZE);
+
+    // 创建worker
+    for (int i = 0; i < WORKER_THREADS; i++)
+    {
+        Pthread_create(&tid, NULL, worker, NULL);
+    }
+
+    // 接受新的accept请求，并将新的connfd插入到sbuf
+    while (1)
+    {
+        clientlen = sizeof(struct sockaddr_storage);
+        connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+        Getnameinfo((SA *)&clientaddr, clientlen, client_hostname, MAXLINE, client_port, MAXLINE, 0);
+        printf("Accepted connection from (%s, %s)\n", client_hostname, client_port);
+        sbuf_insert(&sbuf, connfd); // 将新的connfd插入到sbuf
+    }
+}
+
+void *worker(void *arg)
+{
+    /*worker线程：取出connfd，处理，关闭*/
+    while (1)
+    {
+        int connfd = sbuf_remove(&sbuf);
+        if (connfd == -1)
+        {
+            break;
+        }
+        server_doit(connfd);
+        Close(connfd);
+    }
+    return NULL;
+}
+
+const char *get_registry_url()
+{
+    /*从环境变量中获取REGISTRY，若没有则返回一个默认的url*/
+    char *url = getenv("REGISTRY");
+    if (url == NULL)
+    {
+        url = "https://registry.npmjs.org"; // 默认为此url
+    }
+    return url;
+}
+
+ParsedUri_t parse_uri(const char *uri)
+{
+    /*解析uri，提取出package, version, path, type*/
+    ParsedUri_t res;
+    memset(&res, 0, sizeof(ParsedUri_t));
+
+    if (uri[0] == '/')
+        uri++;
+
+    char *at_sign = strchr(uri, '@');
+    char *slash_sign = strchr(uri, '/');
+
+    if (at_sign && (!slash_sign || at_sign < slash_sign))
+    {
+        /*package @ version*/
+        size_t pkg_len = at_sign - uri;
+        strncpy(res.package, uri, pkg_len);
+        // 版本号结束位置在...
+        const char *ver_start = at_sign + 1;
+        const char *ver_end = slash_sign ? slash_sign : uri + strlen(uri);
+        strncpy(res.version, ver_start, ver_end - ver_start);
+    }
+    else
+    {
+        // 若只有package，则默认为'latest'
+        if (slash_sign)
+        {
+            strncpy(res.package, uri, slash_sign - uri);
+        }
+        else
+        {
+            strncpy(res.package, uri, strlen(uri));
+        }
+        strcpy(res.version, "latest");
+    }
+
+    // 如果接下来还有路径 (slash_sign != null)
+    if (slash_sign)
+    {
+        strcpy(res.path, slash_sign + 1);
+    }
+
+    // 请求类型是
+    if (strlen(res.path) == 0)
+    {
+        res.type = ENTRY;
+    }
+    else if (res.path[strlen(res.path) - 1] == '/')
+    {
+        res.type = REQ_DIR;
+    }
+    else
+    {
+        res.type = REQ_FILE;
+    }
+
+    return res;
+}
+
+int download_tar(const char *tar_url, const char *outfile)
+{
+    /*使用libcurl下载指定的tar包，并存储到outfile。发生任何错误则返回-1，完成返回0*/
+    char command[MAXLINE];
+    struct Membuffer chunk;
+    memset(&chunk, 0, sizeof(struct Membuffer));
+
+    // 使用libcurl下载tar
+    CURL *curl = curl_easy_init();
+    if (!curl)
+        return -1;
+
+    curl_easy_setopt(curl, CURLOPT_URL, tar_url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK)
+    {
+        fprintf(stderr, "curl failed: %s\n", curl_easy_strerror(res));
+        free(chunk.data);
+        return -1;
+    }
+
+    // 用libarchive抽取tar
+    struct archive *a = archive_read_new();
+    archive_read_support_filter_gzip(a);
+    archive_read_support_format_tar(a);
+
+    if (archive_read_open_memory(a, chunk.data, chunk.size) != ARCHIVE_OK)
+    {
+        fprintf(stderr, "archive open failed: %s\n", archive_error_string(a));
+        free(chunk.data);
+        archive_read_free(a);
+        return -1;
+    }
+
+    struct archive *ext = archive_write_disk_new();
+    // opt: 使用归档时间戳 | 使用归档文件权限 | 使用归档ACL | 使用归档文件标志
+    archive_write_disk_set_options(ext, ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM | ARCHIVE_EXTRACT_ACL | ARCHIVE_EXTRACT_FFLAGS);
+    /* （ai写的）使用标准用户/组名解析（如果可用）*/
+    archive_write_disk_set_standard_lookup(ext);
+
+    struct archive_entry *entry;
+    char pathbuffer[1024];
+    /* 计算解包目录：将 outfile 的尾部后缀（如 .tar.gz）去掉，作为目录名 */
+    char outdir[1024];
+    strncpy(outdir, outfile, sizeof(outdir) - 1);
+    outdir[sizeof(outdir) - 1] = '\0';
+    size_t olen = strlen(outdir);
+    if (olen > 7 && strcmp(outdir + olen - 7, ".tar.gz") == 0)
+    {
+        outdir[olen - 7] = '\0';
+    }
+    else
+    {
+        char *dot = strrchr(outdir, '.');
+        if (dot)
+            *dot = '\0';
+    }
+
+    if (mkdir(outdir, 0755) < 0 && errno != EEXIST)
+    {
+        fprintf(stderr, "failed to create outdir %s: %s\n", outdir, strerror(errno));
+        archive_write_close(ext);
+        archive_write_free(ext);
+        archive_read_close(a);
+        archive_read_free(a);
+        free(chunk.data);
+        return -1;
+    }
+    int r = 0;
+    while (1)
+    {
+        int hret = archive_read_next_header(a, &entry);
+        if (hret == ARCHIVE_EOF)
+            break;
+        if (hret != ARCHIVE_OK)
+        {
+            fprintf(stderr, "archive header read error: %s\n", archive_error_string(a));
+            break;
+        }
+
+        const char *currentfile = archive_entry_pathname(entry);
+        /* 基本安全检查：禁止绝对路径和路径穿越 */
+        if (currentfile == NULL || currentfile[0] == '/' || strstr(currentfile, ".."))
+        {
+            fprintf(stderr, "skipping unsafe path: %s\n", currentfile ? currentfile : "(null)");
+            continue;
+        }
+
+        // 生成输出路径: outdir/currentfile
+        snprintf(pathbuffer, sizeof(pathbuffer), "%s/%s", outdir, currentfile);
+        archive_entry_set_pathname(entry, pathbuffer);
+
+        r = archive_write_header(ext, entry);
+        if (r != ARCHIVE_OK)
+        {
+            fprintf(stderr, "write header failed: %s\n", archive_error_string(ext));
+            // 继续处理下一个 entry
+            continue;
+        }
+        else
+        {
+            const void *buff;
+            size_t size;
+            la_int64_t offset;
+
+            while (1)
+            {
+                int dret = archive_read_data_block(a, &buff, &size, &offset);
+                if (dret == ARCHIVE_EOF)
+                    break;
+                if (dret != ARCHIVE_OK)
+                {
+                    fprintf(stderr, "read data block error: %s\n", archive_error_string(a));
+                    break;
+                }
+                if (archive_write_data_block(ext, buff, size, offset) != ARCHIVE_OK)
+                {
+                    fprintf(stderr, "write data block error: %s\n", archive_error_string(ext));
+                    break;
+                }
+            }
+            archive_write_finish_entry(ext);
+        }
+    }
+
+    // 完成后清理打开的缓冲区
+    archive_write_close(ext);
+    archive_write_free(ext);
+    archive_read_close(a);
+    archive_read_free(a);
+    free(chunk.data);
+
+    return 0;
+}
+
+static size_t write_cb(void *contents, size_t size, size_t nmemb, void *userp)
+{
+    size_t realsize = size * nmemb;
+    struct Membuffer *mem = (struct Membuffer *)userp;
+    char *ptr = realloc(mem->data, mem->size + realsize + 1);
+    if (!ptr)
+        return 0;
+
+    mem->data = ptr;
+    memcpy(&(mem->data[mem->size]), contents, realsize); // 将新数据复制到data末尾
+    mem->size += realsize;                               // 更新数据大小
+    /* NUL 终止，方便后续作为字符串处理 */
+    mem->data[mem->size] = '\0';
+    return realsize;
+}
+
+void server_doit(int connfd)
+{
+    rio_t rio;
+    char buffer[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
+
+    Rio_readinitb(&rio, connfd);
+    if (!Rio_readlineb(&rio, buffer, MAXLINE)) // 读取请求行
+        return;
+
+    sscanf(buffer, "%s %s %s", method, uri, version);
+    if (strcasecmp(method, "GET"))
+    {
+        fprintf(stdout, "Received request:\n");
+        fprintf(stdout, "%s", buffer);
+        client_error(connfd, method, "501", "Not Implemented", "Server does not implement this method");
+        return;
+    }
+
+    read_requesthdrs(&rio);
+
+    // 第一步，解析uri
+    ParsedUri_t parsed_uri = parse_uri(uri);
+
+    // 第二步，将registry, package, version拼接成请求url
+    char reg_url[MAXLINE];
+    snprintf(reg_url, sizeof(reg_url), "%s/%s/%s", registry, parsed_uri.package, parsed_uri.version);
+
+    // 第三步，像registry请求
+    struct Membuffer resp = {0};
+
+    CURL *curl = curl_easy_init();
+    if (!curl)
+    {
+        client_error(connfd, "CURL init failed", "500", "Internal Server Error", "Server failed to initialize CURL");
+        return;
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, reg_url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    CURLcode cres = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+
+    if (cres != CURLE_OK || http_code != 200 || !resp.data)
+    {
+        client_error(connfd, reg_url, "502", "Bad Gateway", "Failed to fetch metadata");
+        free(resp.data);
+        return;
+    }
+
+    // 从 resp.data 中解析 tarball_url
+    char tarball_url[MAXLINE] = {0};
+    const char *key = "\"tarball\":\"";
+    char *p = strstr(resp.data, key);
+    if (!p)
+    {
+        client_error(connfd, reg_url, "500", "Internal Server Error", "tarball not found");
+        free(resp.data);
+        return;
+    }
+    p += strlen(key);
+    char *q = strchr(p, '\"');
+    if (!q)
+    {
+        client_error(connfd, reg_url, "500", "Internal Server Error", "malformed tarball url");
+        free(resp.data);
+        return;
+    }
+    size_t llen = q - p;
+    if (llen >= sizeof(tarball_url))
+        llen = sizeof(tarball_url) - 1;
+    strncpy(tarball_url, p, llen);
+    tarball_url[llen] = '\0';
+
+    // 构造本地 outfile并调用 download_tar
+    if (mkdir(TMP_DIR, 0755) < 0 && errno != EEXIST)
+    {
+        client_error(connfd, TMP_DIR, "500", "Internal Server Error", "mkdir failed");
+        free(resp.data);
+        return;
+    }
+    char outfile[MAXLINE];
+    snprintf(outfile, sizeof(outfile), "%s/%s-%s.tar.gz", TMP_DIR, parsed_uri.package, parsed_uri.version);
+
+    if (download_tar(tarball_url, outfile) != 0)
+    {
+        client_error(connfd, tarball_url, "502", "Bad Gateway", "download/extract failed");
+        free(resp.data);
+        return;
+    }
+
+    Rio_writen(connfd, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nok\n", 45);
+    free(resp.data);
+    return;
+}
+
+void read_requesthdrs(rio_t *rp)
+{
+    char buf[MAXLINE];
+
+    Rio_readlineb(rp, buf, MAXLINE);
+    printf("%s", buf);
+    while (strcmp(buf, "\r\n")) // 直到读到空行结束
+    {
+        Rio_readlineb(rp, buf, MAXLINE);
+        printf("%s", buf);
+    }
+    return;
+}
+
+void client_error(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg)
+{
+    char buf[MAXLINE];
+
+    /* Print the HTTP response headers */
+    sprintf(buf, "HTTP/1.0 %s %s\r\n", errnum, shortmsg);
+    Rio_writen(fd, buf, strlen(buf));
+    sprintf(buf, "Content-type: text/html\r\n\r\n");
+    Rio_writen(fd, buf, strlen(buf));
+
+    /* Print the HTTP response body */
+    sprintf(buf, "<html><title>Tiny Error</title>");
+    Rio_writen(fd, buf, strlen(buf));
+    sprintf(buf, "<body bgcolor="
+                 "ffffff"
+                 ">\r\n");
+    Rio_writen(fd, buf, strlen(buf));
+    sprintf(buf, "%s: %s\r\n", errnum, shortmsg);
+    Rio_writen(fd, buf, strlen(buf));
+    sprintf(buf, "<p>%s: %s\r\n", longmsg, cause);
+    Rio_writen(fd, buf, strlen(buf));
+    sprintf(buf, "<hr><em>The Tiny Web server</em>\r\n");
+    Rio_writen(fd, buf, strlen(buf));
+}
