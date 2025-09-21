@@ -1,4 +1,5 @@
 #include "csapp.h"
+#include "cJSON.h"
 #include "sbuf.h"
 #include <curl/curl.h>
 #include <archive.h>
@@ -48,15 +49,11 @@ worker(void *arg);
 /*main begin*/
 int main(int argc, char **argv)
 {
-    char *uri, package[MAXLINE], version[MAXLINE];
-    char url[MAXLINE], outfile[MAXLINE];
     char client_hostname[MAXLINE], client_port[MAXLINE];
     int listenfd, connfd;
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
     pthread_t tid;
-    ParsedUri_t parsed_uri;
-    rio_t rio;
 
     if (argc != 2)
     {
@@ -180,7 +177,6 @@ ParsedUri_t parse_uri(const char *uri)
 int download_tar(const char *tar_url, const char *outfile)
 {
     /*使用libcurl下载指定的tar包，并存储到outfile。发生任何错误则返回-1，完成返回0*/
-    char command[MAXLINE];
     struct Membuffer chunk;
     memset(&chunk, 0, sizeof(struct Membuffer));
 
@@ -222,7 +218,7 @@ int download_tar(const char *tar_url, const char *outfile)
     archive_write_disk_set_standard_lookup(ext);
 
     struct archive_entry *entry;
-    char pathbuffer[1024];
+    char pathbuffer[1026];
     /* 计算解包目录：将 outfile 的尾部后缀（如 .tar.gz）去掉，作为目录名 */
     char outdir[1024];
     strncpy(outdir, outfile, sizeof(outdir) - 1);
@@ -357,7 +353,7 @@ void server_doit(int connfd)
 
     // 第二步，将registry, package, version拼接成请求url
     char reg_url[MAXLINE];
-    snprintf(reg_url, sizeof(reg_url), "%s/%s/%s", registry, parsed_uri.package, parsed_uri.version);
+    snprintf(reg_url, sizeof(reg_url), "%s/%s", registry, parsed_uri.package);
 
     // 第三步，像registry请求
     struct Membuffer resp = {0};
@@ -387,33 +383,73 @@ void server_doit(int connfd)
 
     // 从 resp.data 中解析 tarball_url
     char tarball_url[MAXLINE] = {0};
-    const char *key = "\"tarball\":\"";
-    char *p = strstr(resp.data, key);
-    if (!p)
+    cJSON *json = cJSON_Parse(resp.data);
+    if (!json)
     {
-        client_error(connfd, reg_url, "500", "Internal Server Error", "tarball not found");
+        client_error(connfd, reg_url, "500", "Internal Server Error", "Failed to parse JSON");
         free(resp.data);
         return;
     }
-    p += strlen(key);
-    char *q = strchr(p, '\"');
-    if (!q)
+    cJSON *versions = cJSON_GetObjectItem(json, "versions");
+    if (!versions)
     {
-        client_error(connfd, reg_url, "500", "Internal Server Error", "malformed tarball url");
+        client_error(connfd, reg_url, "500", "Internal Server Error", "No versions found in metadata");
+        cJSON_Delete(json);
         free(resp.data);
         return;
     }
-    size_t llen = q - p;
-    if (llen >= sizeof(tarball_url))
-        llen = sizeof(tarball_url) - 1;
-    strncpy(tarball_url, p, llen);
-    tarball_url[llen] = '\0';
+    cJSON *target_version = NULL;
+    // version==latest
+    if (strcmp(parsed_uri.version, "latest") == 0)
+    {
+        cJSON *dist_tags = cJSON_GetObjectItem(json, "dist-tags");
+        if (dist_tags)
+        {
+            cJSON *latest_version = cJSON_GetObjectItem(dist_tags, "latest");
+            if (latest_version && cJSON_IsString(latest_version))
+            {
+                // 使用最新版本号查找
+                target_version = cJSON_GetObjectItem(versions, latest_version->valuestring);
+            }
+        }
+    }
+    else
+    {
+        target_version = cJSON_GetObjectItem(versions, parsed_uri.version);
+    }
+
+    if (!target_version)
+    {
+        client_error(connfd, parsed_uri.version, "404", "Not Found", "Specified version not found");
+        cJSON_Delete(json);
+        free(resp.data);
+        return;
+    }
+    cJSON *dist = cJSON_GetObjectItem(target_version, "dist");
+    if (!dist)
+    {
+        client_error(connfd, reg_url, "500", "Internal Server Error", "No dist found in metadata");
+        cJSON_Delete(json);
+        free(resp.data);
+        return;
+    }
+    cJSON *tarball_item = cJSON_GetObjectItem(dist, "tarball");
+    if (!tarball_item || !cJSON_IsString(tarball_item))
+    {
+        client_error(connfd, reg_url, "500", "Internal Server Error", "Tarball URL not found in JSON");
+        cJSON_Delete(json);
+        free(resp.data);
+        return;
+    }
+
+    strcpy(tarball_url, tarball_item->valuestring);
+    cJSON_Delete(json);
+    free(resp.data);
 
     // 构造本地 outfile并调用 download_tar
     if (mkdir(TMP_DIR, 0755) < 0 && errno != EEXIST)
     {
         client_error(connfd, TMP_DIR, "500", "Internal Server Error", "mkdir failed");
-        free(resp.data);
         return;
     }
     char outfile[MAXLINE];
@@ -422,12 +458,10 @@ void server_doit(int connfd)
     if (download_tar(tarball_url, outfile) != 0)
     {
         client_error(connfd, tarball_url, "502", "Bad Gateway", "download/extract failed");
-        free(resp.data);
         return;
     }
 
     Rio_writen(connfd, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nok\n", 45);
-    free(resp.data);
     return;
 }
 
