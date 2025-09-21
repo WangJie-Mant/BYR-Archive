@@ -510,8 +510,8 @@ void server_doit(int connfd)
     char outdir[MAXLINE];
     snprintf(outdir, sizeof(outdir), "%s/%s-%s", TMP_DIR, safe_package_name, parsed_uri.version);
 
-    char target_filepath[MAXLINE];
-    snprintf(target_filepath, sizeof(target_filepath), "%s/%s", outdir, parsed_uri.path);
+    char target_filepath_a[MAXLINE];
+    snprintf(target_filepath_a, sizeof(target_filepath_a), "%s/%s", outdir, parsed_uri.path);
 
     // 3. 检查缓存是否存在，如果不存在则下载
     struct stat sbuf;
@@ -593,7 +593,7 @@ void server_doit(int connfd)
 
         // 更新 outdir 和 target_filepath 以使用确切的版本号
         snprintf(outdir, sizeof(outdir), "%s/%s-%s", TMP_DIR, safe_package_name, actual_version);
-        snprintf(target_filepath, sizeof(target_filepath), "%s/%s", outdir, parsed_uri.path);
+        snprintf(target_filepath_a, sizeof(target_filepath_a), "%s/%s", outdir, parsed_uri.path);
 
         cJSON *dist = cJSON_GetObjectItem(target_version_json, "dist");
         cJSON *tarball_item = dist ? cJSON_GetObjectItem(dist, "tarball") : NULL;
@@ -624,14 +624,24 @@ void server_doit(int connfd)
         printf("Cache hit for %s.\n", outdir);
     }
 
-    // 4. 根据请求类型提供服务
+    // 4. 根据请求类型提供服务  DEBUG: 添加'puckage/'目录的情况
+    char target_filepath[MAXLINE];
+    snprintf(target_filepath, sizeof(target_filepath), "%s/package/%s", outdir, parsed_uri.path);
+
+    // 如果在package目录下找不到，再尝试根目录
+    if (stat(target_filepath, &sbuf) != 0)
+    {
+        snprintf(target_filepath, sizeof(target_filepath), "%s/%s", outdir, parsed_uri.path);
+    }
+
+    // 再根据type请求正确的服务
     if (parsed_uri.type == ENTRY)
     {
         // --- 入口点解析逻辑 ---
         char package_json_path[MAXLINE];
         snprintf(package_json_path, sizeof(package_json_path), "%s/package/package.json", outdir);
 
-        // npm 包解压后通常会有一个 'package' 子目录
+        // npm 包解压后通常会有一个 'package' 子目录。如果package.json不在这里，则尝试上一级目录
         if (stat(package_json_path, &sbuf) != 0)
         {
             snprintf(package_json_path, sizeof(package_json_path), "%s/package.json", outdir);
