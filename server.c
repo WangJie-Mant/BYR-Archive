@@ -104,6 +104,7 @@ void *worker(void *arg)
     while (1)
     {
         int connfd = sbuf_remove(&sbuf);
+        printf("Worker thread %lu handling connfd=%d\n", (unsigned long)Pthread_self(), connfd);
         if (connfd == -1)
         {
             break;
@@ -740,9 +741,16 @@ void server_doit(int connfd)
             cJSON *pkg_json = cJSON_Parse(pkg_content);
             if (pkg_json)
             {
+                cJSON *jsdelivr = cJSON_GetObjectItem(pkg_json, "jsdelivr");
                 cJSON *exports = cJSON_GetObjectItem(pkg_json, "exports");
                 cJSON *main = cJSON_GetObjectItem(pkg_json, "main");
-                if (exports)
+                // 如果 package.json 中定义了 "jsdelivr" 字段，则使用该字段指定的路径。
+                if (jsdelivr && cJSON_IsString(jsdelivr) && strlen(jsdelivr->valuestring) > 0)
+                {
+                    strcpy(entry_point_path, jsdelivr->valuestring);
+                }
+                // 否则，检查 exports["."]：
+                else if (exports)
                 {
                     cJSON *dot_export = cJSON_GetObjectItem(exports, ".");
                     if (dot_export)
@@ -761,9 +769,15 @@ void server_doit(int connfd)
                         }
                     }
                 }
+                // 如果没有符合条件的 exports["."] 则使用"main"字段。
                 else if (main && cJSON_IsString(main))
                 {
                     strcpy(entry_point_path, main->valuestring);
+                }
+                // 如果以上匹配条件均不满足，则报错并返回404 Not Found
+                else
+                {
+                    client_error(connfd, package_json_path, "404", "Not Found", "No valid entry point found");
                 }
                 cJSON_Delete(pkg_json);
             }
