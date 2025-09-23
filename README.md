@@ -76,5 +76,7 @@ sudo apt-get install libarchive-dev
 
 在测试过程中，Gemini还能够根据我反馈的错误信息在代码中定位可能的错误地点，为debug提供了非常方便快捷的帮助。
 
-Change 0923：用Gemini写了个home.html，提供默认的网站支持，做的网页相当美观，挺中意的
+Change 0923：
+- 用Gemini写了个home.html，提供默认的网站支持，做的网页相当美观，挺中意的
+- 更新了新的对入口文件的解析规则
 
