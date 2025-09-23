@@ -498,6 +498,18 @@ void server_doit(int connfd)
         return;
     }
 
+    // Change：添加默认进入的home.html，提供banner.png的头图支持
+    if (strcmp(uri, "/") == 0)
+    {
+        serve_file(connfd, "home.html");
+        return;
+    }
+    if (strcmp(uri, "/banner.png") == 0)
+    {
+        serve_file(connfd, "banner.png");
+        return;
+    }
+
     // 在解析前对uri调用解码函数
     url_decode(uri, decoded_uri);
     // DEBUG: printf
